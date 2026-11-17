@@ -30,6 +30,7 @@ def test_empty_input():
 @pytest.mark.parametrize("line", [
     "", "\n", "not a log entry", record().replace('"GET / HTTP/1.0"', '"-"'),
     record().replace("HTTP/1.0", "bogus"), record().replace("GET /", "GET "),
+    record(path='/bad"path'), record().replace("GET", 'GE"T'),
     record(date="30/Feb/2000:13:55:36 +0000"),
     record(date="10/Foo/2000:13:55:36 +0000"),
     record(date="10/Oct/2000:25:55:36 +0000"),
@@ -74,3 +75,11 @@ def test_large_bytes_crlf_and_unterminated_last_line():
     assert result["request_count"] == 2
     assert result["malformed_count"] == 0
     assert result["total_bytes"] == 2**80
+
+
+def test_escaped_request_quotes_are_preserved():
+    path = r'/say\"hello'
+    result = summarize([record(path=path)])
+    assert result["request_count"] == 1
+    assert result["malformed_count"] == 0
+    assert result["top_paths"] == [{"path": path, "count": 1}]

@@ -11,7 +11,7 @@ _MONTHS = {name: number for number, name in enumerate(
 )}
 _RECORD = re.compile(
     r'\S+ \S+ \S+ \[(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) '
-    r'([+-])(\d{2})(\d{2})\] "\S+ (\S+) HTTP/\d+\.\d+" ([1-5]\d{2}) (\d+|-)',
+    r'([+-])(\d{2})(\d{2})\] "[^"\s]+ ((?:\\.|[^"\\\s])+) HTTP/\d+\.\d+" ([1-5]\d{2}) (\d+|-)',
     re.ASCII,
 )
 

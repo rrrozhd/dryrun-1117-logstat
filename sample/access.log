@@ -1,0 +1,7 @@
+127.0.0.1 - alice [17/Nov/2026:09:05:10 -0500] "GET / HTTP/1.1" 200 120
+127.0.0.2 - - [17/Nov/2026:09:08:00 -0500] "GET /products?sort=price HTTP/1.1" 200 340
+127.0.0.3 - - [17/Nov/2026:14:20:00 +0000] "GET /products?sort=name HTTP/1.1" 200 360
+127.0.0.4 - - [17/Nov/2026:10:00:00 -0500] "GET /missing HTTP/1.1" 404 45
+127.0.0.5 - bob [17/Nov/2026:15:15:00 +0000] "POST /checkout HTTP/1.1" 201 90
+127.0.0.6 - - [17/Nov/2026:15:30:00 +0000] "GET /health HTTP/1.1" 204 -
+not a Common Log Format record

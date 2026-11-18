@@ -22,14 +22,30 @@ EMPTY_SUMMARY = {
 }
 
 
-def run_cli(*args):
+def run_cli(*args, text=True):
     return subprocess.run(
         [sys.executable, "-m", "logstat", *map(str, args)],
         cwd=ROOT,
         capture_output=True,
-        text=True,
+        text=text,
         timeout=10,
     )
+
+
+def assert_csv_header_suppression(path, *args):
+    normal = run_cli(path, "--format", "csv", *args, text=False)
+    headerless = run_cli(path, "--format", "csv", "--no-header", *args, text=False)
+
+    assert normal.returncode == 0, normal.stderr
+    assert headerless.returncode == 0, headerless.stderr
+    assert normal.stderr == headerless.stderr == b""
+    normal_rows = list(csv.reader(normal.stdout.decode("utf-8").splitlines()))
+    headerless_rows = list(csv.reader(headerless.stdout.decode("utf-8").splitlines()))
+    assert normal_rows.count(["metric", "key", "value"]) == 1
+    assert normal.stdout.startswith(b"metric,key,value\n")
+    assert headerless.stdout == normal.stdout.partition(b"\n")[2]
+    assert headerless_rows == normal_rows[1:]
+    return headerless_rows
 
 
 @pytest.fixture
@@ -116,6 +132,65 @@ def test_csv_path_quoting_round_trips(tmp_path, request_path):
     assert [row for row in rows if row[0] == "top_paths"] == [["top_paths", request_path, "1"]]
 
 
+@pytest.mark.parametrize("args", [
+    (),
+    ("--since", "2026-11-17T15:00:00Z", "--until", "2026-11-17T15:30:00Z",
+     "--status", "2xx", "--top", "1"),
+    ("--status", "2xx", "--status", "200", "--status", "404", "--status", "404"),
+    ("--top", "0"),
+    ("--status", "500"),
+])
+def test_no_header_preserves_sample_data_and_filters(args):
+    assert_csv_header_suppression("sample/access.log", *args)
+
+
+@pytest.mark.parametrize("request_path", ["/comma,path", r'/escaped\"quote', r'/both,\"quoted\"'])
+def test_no_header_preserves_quoted_keys(tmp_path, request_path):
+    path = tmp_path / "quoted.log"
+    path.write_text(VALID_LINE.replace("/alpha", request_path), encoding="utf-8")
+
+    rows = assert_csv_header_suppression(path)
+
+    assert [row for row in rows if row[0] == "top_paths"] == [["top_paths", request_path, "1"]]
+
+
+@pytest.mark.parametrize("contents,malformed", [("", 0), ("broken\n\n", 2)])
+def test_no_header_preserves_empty_scalar_rows(tmp_path, contents, malformed):
+    path = tmp_path / "empty.log"
+    path.write_text(contents, encoding="utf-8")
+
+    assert assert_csv_header_suppression(path) == [
+        ["request_count", "", "0"], ["malformed_count", "", str(malformed)],
+        ["total_bytes", "", "0"],
+    ]
+
+
+def test_no_header_can_precede_csv_format():
+    before = run_cli("--no-header", "--format", "csv", "sample/access.log")
+    after = run_cli("sample/access.log", "--format", "csv", "--no-header")
+
+    assert before.returncode == after.returncode == 0
+    assert before.stderr == after.stderr == ""
+    assert before.stdout == after.stdout
+    assert before.stdout.startswith("request_count,,6\n")
+
+
+@pytest.mark.parametrize("output_args", [(), ("--format", "text"), ("--json",)])
+@pytest.mark.parametrize("no_header_first", [False, True])
+def test_no_header_requires_csv_before_input_access(tmp_path, output_args, no_header_first):
+    args = ["--no-header", *output_args] if no_header_first else [*output_args, "--no-header"]
+    missing = tmp_path / "missing.log"
+    result = run_cli(*args, missing) if no_header_first else run_cli(missing, *args)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "usage:" in result.stderr.lower()
+    assert "--no-header requires --format csv" in result.stderr
+    assert "unrecognized arguments" not in result.stderr.lower()
+    assert str(missing) not in result.stderr
+    assert "traceback" not in result.stderr.lower()
+
+
 @pytest.mark.parametrize("csv_output", [False, True], ids=["json", "csv"])
 @pytest.mark.parametrize("contents,malformed", [("", 0), ("broken\n\n", 2)])
 def test_empty_and_all_malformed_files_succeed(tmp_path, contents, malformed, csv_output):
@@ -190,6 +265,7 @@ def test_help_describes_input_and_output_options():
     assert "logfile" in result.stdout.lower()
     assert "--json" in result.stdout
     assert "--format" in result.stdout
+    assert "--no-header" in result.stdout
     assert "csv" in result.stdout
 
 
@@ -207,8 +283,10 @@ def test_damaged_utf8_line_does_not_hide_valid_requests(tmp_path):
     assert summary["total_bytes"] == 10
 
 
-@pytest.mark.parametrize("output_format", ["text", "json", "csv"])
-def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, output_format):
+@pytest.mark.parametrize("output_format,no_header", [
+    ("text", False), ("json", False), ("csv", False), ("csv", True),
+])
+def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, output_format, no_header):
     monkeypatch.setenv("PYTHONINTMAXSTRDIGITS", "640")
     prefix = VALID_LINE.rsplit(" ", 1)[0] + " "
     valid = prefix + "9" * 640 + "\n"
@@ -217,6 +295,8 @@ def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, output_form
     path.write_text(valid * 2 + oversized, encoding="utf-8")
 
     args = ["--json"] if output_format == "json" else ["--format", output_format]
+    if no_header:
+        args.append("--no-header")
     result = run_cli(path, *args)
 
     assert result.returncode == 0, result.stderr
@@ -228,8 +308,11 @@ def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, output_form
         assert summary["malformed_count"] == "1"
         assert summary["total_bytes"] == expected_total
     elif output_format == "csv":
-        assert list(csv.reader(result.stdout.splitlines()))[:4] == [
-            ["metric", "key", "value"], ["request_count", "", "2"],
+        rows = list(csv.reader(result.stdout.splitlines()))
+        if not no_header:
+            assert rows.pop(0) == ["metric", "key", "value"]
+        assert rows[:3] == [
+            ["request_count", "", "2"],
             ["malformed_count", "", "1"], ["total_bytes", "", expected_total],
         ]
     else:

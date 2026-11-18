@@ -59,9 +59,49 @@ Requests per hour (UTC):
 | `top_paths` | Up to `--top N` objects with `path` and `count` (default 10) |
 | `requests_per_hour` | Object mapping UTC hour strings to counts |
 
+## CSV output
+
+Use `--format csv` to export the same summary with columns `metric,key,value`.
+For example, the included sample's single 404 response produces:
+
+```sh
+python -m logstat sample/access.log --format csv --status 404
+```
+
+```csv
+metric,key,value
+request_count,,1
+malformed_count,,1
+total_bytes,,45
+status_counts,404,1
+top_paths,/missing,1
+requests_per_hour,2026-11-17T15:00:00Z,1
+```
+
+The first three data rows are `request_count`, `malformed_count` and `total_bytes`,
+with empty keys. Then `status_counts`, `top_paths` and `requests_per_hour` rows
+pair each status code, path or UTC hour with its count. These rows follow the
+same ordering and path limit as text and JSON. Empty collections add no rows;
+empty input still includes the three zero scalar rows. Commas and quotes in
+keys use standard CSV quoting.
+
+Add `--no-header` to omit only the `metric,key,value` row:
+
+```sh
+python -m logstat sample/access.log --format csv --status 404 --no-header
+```
+
+All six data rows in the example remain unchanged. `--no-header` requires
+`--format csv`; using it with default text, `--format text` or `--json` is an
+argument error (exit 2), checked before reading the input file.
+
+Text remains the default, and `--format text` selects it explicitly. `--json`
+continues to select JSON; combining it with any explicit `--format`, or selecting
+an unknown format, is an argument error (exit 2).
+
 ## Filters
 
-Filters work in both text and `--json` output. Without them, all valid requests
+Filters work in text, JSON and CSV output. Without them, all valid requests
 are counted as before.
 
 | Option | Meaning |
@@ -115,7 +155,7 @@ entire input; valid records excluded by filters are not malformed.
   and are skipped. Combined Log Format's extra fields are not supported.
 - A byte size of `-` contributes zero. Individual integer fields exceeding
   Python's configured conversion limit are malformed; sums of accepted values
-  retain their exact value in both output formats.
+  retain their exact value in all output formats.
 - Query strings are removed from request targets. Case, percent encoding and
   escaped characters are retained. Paths are ordered by count descending, then
   alphabetically for ties; `--top` limits the displayed paths (default ten).
@@ -136,8 +176,8 @@ pytest
 ```
 
 The tests cover malformed inputs, deterministic aggregation, time-zone conversion,
-exact time boundaries, status unions, path limits, the real command's text and
-JSON output, and file/argument errors.
+exact time boundaries, status unions, path limits, the real command's text,
+JSON and CSV output, optional CSV headers, and file/argument errors.
 
 ## Code and maintenance
 
@@ -149,7 +189,7 @@ are timezone-aware `datetime` objects (any offset); naive or reversed bounds
 raise `ValueError`. `statuses` is a set of code strings: `None` includes all,
 while an empty set matches none. `top` is a nonnegative integer.
 `logstat/__main__.py` validates CLI arguments, reads the file, calls that function,
-and renders text or JSON from the same result.
+and renders text, JSON or CSV from the same result.
 
 For a counting problem, reduce the input to the relevant lines and compare
 `--json` output with the counting rules. For an invocation problem, check the

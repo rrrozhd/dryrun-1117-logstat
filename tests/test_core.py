@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -120,6 +121,27 @@ def test_time_bounds_use_exact_instants(since, until, expected_paths):
 def test_invalid_time_bounds_are_rejected(bounds):
     with pytest.raises(ValueError):
         summarize([], **bounds)
+
+
+def test_repeated_hour_bounds_compare_instants_instead_of_wall_times():
+    zone = ZoneInfo("America/New_York")
+    since = datetime(2026, 11, 1, 1, 45, tzinfo=zone, fold=0)
+    until = datetime(2026, 11, 1, 1, 15, tzinfo=zone, fold=1)
+    lines = [record(date="01/Nov/2026:06:00:00 +0000")]
+    expected = summarize(lines, since=since.astimezone(timezone.utc),
+                         until=until.astimezone(timezone.utc))
+    assert expected["request_count"] == 1
+    assert summarize(lines, since=since, until=until) == expected
+    with pytest.raises(ValueError):
+        summarize(lines, since=until, until=since)
+
+
+def test_bound_comparison_preserves_full_datetime_range():
+    since = datetime.min.replace(tzinfo=timezone(timedelta(hours=1)))
+    until = datetime.max.replace(tzinfo=timezone(timedelta(hours=-1)))
+    assert summarize([record()], since=since, until=until) == summarize([record()])
+    with pytest.raises(ValueError):
+        summarize([], since=until, until=since)
 
 
 @pytest.mark.parametrize("statuses,expected_count", [(None, 1), (set(), 0)])

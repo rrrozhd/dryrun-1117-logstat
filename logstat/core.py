@@ -56,8 +56,12 @@ def summarize(
     for name, bound in (("since", since), ("until", until)):
         if bound is not None and bound.utcoffset() is None:
             raise ValueError(f"{name} must be timezone-aware")
-    if since is not None and until is not None and since > until:
-        raise ValueError("since must not be later than until")
+    if since is not None and until is not None:
+        # Same-zone datetime comparisons ignore fold. Compare UTC elapsed time
+        # without converting endpoints, which can overflow at datetime limits.
+        elapsed = until.replace(tzinfo=None) - since.replace(tzinfo=None)
+        if elapsed < until.utcoffset() - since.utcoffset():
+            raise ValueError("since must not be later than until")
     if not isinstance(top, int) or top < 0:
         raise ValueError("top must be a nonnegative integer")
     request_count = malformed_count = total_bytes = 0

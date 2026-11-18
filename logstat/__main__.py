@@ -65,11 +65,12 @@ def format_text(summary: dict) -> str:
     return "\n".join(lines)
 
 
-def format_csv(summary: dict) -> str:
+def format_csv(summary: dict, *, no_header: bool = False) -> str:
     """Render summary numbers as metric, key and value records."""
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\n")
-    writer.writerow(("metric", "key", "value"))
+    if not no_header:
+        writer.writerow(("metric", "key", "value"))
     for metric in ("request_count", "malformed_count", "total_bytes"):
         writer.writerow((metric, "", summary[metric]))
     sections = [
@@ -91,6 +92,8 @@ def main() -> int:
     output_options.add_argument("--json", action="store_true", help="print the summary as JSON")
     output_options.add_argument("--format", choices=("text", "csv"), default="text",
                                 help="summary output format (default: text)")
+    parser.add_argument("--no-header", action="store_true",
+                        help="omit the header row (requires --format csv)")
     parser.add_argument("--since", type=utc_timestamp, metavar="UTC",
                         help="include requests at or after this UTC timestamp")
     parser.add_argument("--until", type=utc_timestamp, metavar="UTC",
@@ -100,6 +103,8 @@ def main() -> int:
     parser.add_argument("--top", type=nonnegative_int, default=10, metavar="N",
                         help="show at most N top paths (nonnegative; default: 10)")
     args = parser.parse_args()
+    if args.no_header and args.format != "csv":
+        parser.error("--no-header requires --format csv")
     if args.since is not None and args.until is not None and args.since > args.until:
         parser.error("--since must not be later than --until")
     statuses = {code for selector in args.status for code in selector} if args.status else None
@@ -119,7 +124,7 @@ def main() -> int:
         if limit and summary["total_bytes"] >= 10**limit:
             sys.set_int_max_str_digits(summary["total_bytes"].bit_length())
         if args.format == "csv":
-            output = format_csv(summary)
+            output = format_csv(summary, no_header=args.no_header)
         else:
             output = json.dumps(summary, indent=2) if args.json else format_text(summary)
     finally:

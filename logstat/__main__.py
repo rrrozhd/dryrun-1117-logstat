@@ -1,10 +1,47 @@
 """Command-line summaries of Common Log Format access logs."""
 
 import argparse
+from datetime import datetime
 import json
+import re
 import sys
 
 from .core import summarize
+
+
+def utc_timestamp(value: str) -> datetime:
+    message = (
+        "expected a UTC timestamp YYYY-MM-DDTHH:MM:SS[.fraction]Z or +00:00 "
+        "(1–6 fractional digits)"
+    )
+    if not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)", value
+    ):
+        raise argparse.ArgumentTypeError(message)
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(message) from error
+
+
+def status_codes(value: str) -> set[str]:
+    if re.fullmatch(r"[1-5][0-9]{2}", value):
+        return {value}
+    if re.fullmatch(r"[1-5]xx", value):
+        start = int(value[0]) * 100
+        return {str(code) for code in range(start, start + 100)}
+    raise argparse.ArgumentTypeError("expected a status code 100–599 or class 1xx–5xx")
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a nonnegative integer") from error
+    if number < 0:
+        raise argparse.ArgumentTypeError("expected a nonnegative integer")
+    return number
 
 
 def format_text(summary: dict) -> str:
@@ -32,11 +69,23 @@ def main() -> int:
     )
     parser.add_argument("logfile", help="path to the access log")
     parser.add_argument("--json", action="store_true", help="print the summary as JSON")
+    parser.add_argument("--since", type=utc_timestamp, metavar="UTC",
+                        help="include requests at or after this UTC timestamp")
+    parser.add_argument("--until", type=utc_timestamp, metavar="UTC",
+                        help="include requests before this UTC timestamp")
+    parser.add_argument("--status", type=status_codes, action="append", metavar="CODE|CLASS",
+                        help="keep a status code or class, e.g. 404 or 5xx (repeatable)")
+    parser.add_argument("--top", type=nonnegative_int, default=10, metavar="N",
+                        help="show at most N top paths (nonnegative; default: 10)")
     args = parser.parse_args()
+    if args.since is not None and args.until is not None and args.since > args.until:
+        parser.error("--since must not be later than --until")
+    statuses = {code for selector in args.status for code in selector} if args.status else None
 
     try:
         with open(args.logfile, encoding="utf-8", errors="replace") as logfile:
-            summary = summarize(logfile)
+            summary = summarize(logfile, since=args.since, until=args.until,
+                                statuses=statuses, top=args.top)
     except OSError as error:
         print(f"logstat: {error}", file=sys.stderr)
         return 1

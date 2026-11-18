@@ -186,3 +186,154 @@ def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, json_output
     else:
         assert "Requests: 2\nMalformed lines: 1\n" in result.stdout
         assert f"Total bytes: {expected_total}\n" in result.stdout
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("args,requests,total_bytes", [
+    (("--since", "2026-11-17T15:00:00Z"), 3, 135),
+    (("--until", "2026-11-17T15:00:00Z"), 3, 820),
+    (("--status", "404"), 1, 45),
+    (("--status", "2xx"), 5, 910),
+])
+def test_sample_filters_in_both_formats(args, requests, total_bytes, json_output):
+    result = run_cli("sample/access.log", *args, *(["--json"] if json_output else []))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    if json_output:
+        summary = json.loads(result.stdout)
+        assert summary["request_count"] == requests
+        assert summary["total_bytes"] == total_bytes
+        assert summary["malformed_count"] == 1
+    else:
+        assert result.stdout.startswith(
+            f"Requests: {requests}\nMalformed lines: 1\nTotal bytes: {total_bytes}\n"
+        )
+
+
+def test_all_filters_intersect():
+    result = run_cli("sample/access.log", "--json", "--since", "2026-11-17T15:00:00Z",
+                     "--until", "2026-11-17T15:30:00Z", "--status", "2xx", "--top", "1")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "request_count": 1, "malformed_count": 1, "total_bytes": 90,
+        "status_counts": {"201": 1},
+        "top_paths": [{"path": "/checkout", "count": 1}],
+        "requests_per_hour": {"2026-11-17T15:00:00Z": 1},
+    }
+
+
+def test_repeated_statuses_form_a_union_without_double_counting():
+    result = run_cli("sample/access.log", "--json", "--status", "2xx", "--status", "200",
+                     "--status", "404", "--status", "404")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    summary = json.loads(result.stdout)
+    assert summary["request_count"] == 6
+    assert summary["total_bytes"] == 955
+    assert summary["status_counts"] == {"200": 3, "201": 1, "204": 1, "404": 1}
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("top", [0, 3])
+def test_top_limits_only_paths_with_deterministic_ties(top, json_output):
+    result = run_cli("sample/access.log", "--top", top, *(["--json"] if json_output else []))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    paths = [{"path": "/products", "count": 2}, {"path": "/", "count": 1},
+             {"path": "/checkout", "count": 1}][:top]
+    if json_output:
+        summary = json.loads(result.stdout)
+        assert summary["top_paths"] == paths
+        assert summary["request_count"] == 6
+        assert summary["total_bytes"] == 955
+        assert summary["requests_per_hour"] == {
+            "2026-11-17T14:00:00Z": 3, "2026-11-17T15:00:00Z": 3,
+        }
+    else:
+        assert result.stdout.startswith("Requests: 6\nMalformed lines: 1\nTotal bytes: 955\n")
+        rows = "".join(f"  {item['path']}: {item['count']}\n" for item in paths) or "  (none)\n"
+        assert f"Top paths:\n{rows}Requests per hour (UTC):\n" in result.stdout
+
+
+@pytest.mark.parametrize("args", [
+    ("--status", "500"),
+    ("--since", "2026-11-18T00:00:00Z"),
+    ("--since", "2026-11-17T15:00:00Z", "--until", "2026-11-17T15:00:00Z"),
+])
+def test_filters_with_no_matches_preserve_malformed_count(args):
+    result = run_cli("sample/access.log", "--json", *args)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {**EMPTY_SUMMARY, "malformed_count": 1}
+
+
+@pytest.mark.parametrize("flag", ["--since", "--until"])
+@pytest.mark.parametrize("suffix", ["Z", "+00:00"] + ["." + "0" * n + "1Z" for n in range(6)])
+def test_utc_timestamp_spellings_and_fractional_boundaries(flag, suffix):
+    result = run_cli("sample/access.log", "--json", flag, "2026-11-17T15:00:00" + suffix)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    expected = {
+        ("--since", False): (3, 135), ("--since", True): (2, 90),
+        ("--until", False): (3, 820), ("--until", True): (4, 865),
+    }[flag, suffix.startswith(".")]
+    summary = json.loads(result.stdout)
+    assert (summary["request_count"], summary["total_bytes"]) == expected
+    assert summary["malformed_count"] == 1
+
+
+@pytest.mark.parametrize("flag", ["--since", "--until"])
+@pytest.mark.parametrize("value", [
+    "20261117T150000Z", "2026-11-17 15:00:00Z", "2026-11-17t15:00:00z",
+    "2026-02-30T15:00:00Z", "2026-11-17T15:00:00", "2026-11-17T15:00:00+01:00",
+    "2026-11-17T15:00:00.1234567Z",
+])
+def test_invalid_timestamps_are_argument_errors(flag, value):
+    assert_argument_error(flag, value)
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--status", "99"), ("--status", "600"), ("--status", "2XX"), ("--status", "200,404"),
+    ("--top", "-1"), ("--top", "1.5"),
+])
+def test_invalid_status_and_top_are_argument_errors(flag, value):
+    assert_argument_error(flag, value)
+
+
+def assert_argument_error(flag, value):
+    result = run_cli("sample/access.log", flag, value)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "usage:" in result.stderr.lower()
+    assert flag in result.stderr
+    assert "error:" in result.stderr.lower()
+    assert "unrecognized arguments" not in result.stderr.lower()
+    assert "traceback" not in result.stderr.lower()
+
+
+def test_reversed_time_window_is_an_argument_error():
+    result = run_cli("sample/access.log", "--since", "2026-11-17T15:00:01Z",
+                     "--until", "2026-11-17T15:00:00Z")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "since" in result.stderr and "until" in result.stderr
+    assert "unrecognized arguments" not in result.stderr.lower()
+    assert "traceback" not in result.stderr.lower()
+
+
+def test_help_describes_filter_options():
+    result = run_cli("--help")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    for flag in ("--since", "--until", "--status", "--top"):
+        assert flag in result.stdout

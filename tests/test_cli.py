@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 import subprocess
@@ -61,8 +62,9 @@ def test_json_summary_matches_hand_counted_log(mixed_log):
     }
 
 
-def test_default_text_summary_matches_hand_counted_log(mixed_log):
-    result = run_cli(mixed_log)
+@pytest.mark.parametrize("args", [(), ("--format", "text")])
+def test_default_and_explicit_text_summary_match_hand_counted_log(mixed_log, args):
+    result = run_cli(mixed_log, *args)
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
@@ -82,16 +84,55 @@ def test_default_text_summary_matches_hand_counted_log(mixed_log):
     )
 
 
-@pytest.mark.parametrize("contents,malformed", [("", 0), ("broken\n\n", 2)])
-def test_empty_and_all_malformed_files_succeed(tmp_path, contents, malformed):
-    path = tmp_path / "access.log"
-    path.write_text(contents, encoding="utf-8")
-
-    result = run_cli(path, "--json")
+def test_csv_summary_matches_hand_counted_log(mixed_log):
+    result = run_cli(mixed_log, "--format", "csv")
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    assert json.loads(result.stdout) == {**EMPTY_SUMMARY, "malformed_count": malformed}
+    assert list(csv.reader(result.stdout.splitlines())) == [
+        ["metric", "key", "value"],
+        ["request_count", "", "3"],
+        ["malformed_count", "", "2"],
+        ["total_bytes", "", "35"],
+        ["status_counts", "200", "2"],
+        ["status_counts", "404", "1"],
+        ["top_paths", "/alpha", "2"],
+        ["top_paths", "/beta", "1"],
+        ["requests_per_hour", "2000-10-10T20:00:00Z", "2"],
+        ["requests_per_hour", "2000-10-10T21:00:00Z", "1"],
+    ]
+
+
+@pytest.mark.parametrize("request_path", ["/comma,path", r'/escaped\"quote', r'/both,\"quoted\"'])
+def test_csv_path_quoting_round_trips(tmp_path, request_path):
+    path = tmp_path / "quoted.log"
+    path.write_text(VALID_LINE.replace("/alpha", request_path), encoding="utf-8")
+
+    result = run_cli(path, "--format", "csv")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    rows = list(csv.reader(result.stdout.splitlines()))
+    assert [row for row in rows if row[0] == "top_paths"] == [["top_paths", request_path, "1"]]
+
+
+@pytest.mark.parametrize("csv_output", [False, True], ids=["json", "csv"])
+@pytest.mark.parametrize("contents,malformed", [("", 0), ("broken\n\n", 2)])
+def test_empty_and_all_malformed_files_succeed(tmp_path, contents, malformed, csv_output):
+    path = tmp_path / "access.log"
+    path.write_text(contents, encoding="utf-8")
+
+    result = run_cli(path, *(["--format", "csv"] if csv_output else ["--json"]))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    if csv_output:
+        assert list(csv.reader(result.stdout.splitlines())) == [
+            ["metric", "key", "value"], ["request_count", "", "0"],
+            ["malformed_count", "", str(malformed)], ["total_bytes", "", "0"],
+        ]
+    else:
+        assert json.loads(result.stdout) == {**EMPTY_SUMMARY, "malformed_count": malformed}
 
 
 def test_empty_text_sections_are_explicit(tmp_path):
@@ -140,7 +181,7 @@ def test_invalid_arguments_report_usage(tmp_path, args):
     assert "traceback" not in result.stderr.lower()
 
 
-def test_help_describes_input_and_json_option():
+def test_help_describes_input_and_output_options():
     result = run_cli("--help")
 
     assert result.returncode == 0, result.stderr
@@ -148,6 +189,8 @@ def test_help_describes_input_and_json_option():
     assert "usage:" in result.stdout.lower()
     assert "logfile" in result.stdout.lower()
     assert "--json" in result.stdout
+    assert "--format" in result.stdout
+    assert "csv" in result.stdout
 
 
 def test_damaged_utf8_line_does_not_hide_valid_requests(tmp_path):
@@ -164,8 +207,8 @@ def test_damaged_utf8_line_does_not_hide_valid_requests(tmp_path):
     assert summary["total_bytes"] == 10
 
 
-@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
-def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, json_output):
+@pytest.mark.parametrize("output_format", ["text", "json", "csv"])
+def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, output_format):
     monkeypatch.setenv("PYTHONINTMAXSTRDIGITS", "640")
     prefix = VALID_LINE.rsplit(" ", 1)[0] + " "
     valid = prefix + "9" * 640 + "\n"
@@ -173,16 +216,22 @@ def test_large_accumulated_bytes_remain_exact(tmp_path, monkeypatch, json_output
     path = tmp_path / "large.log"
     path.write_text(valid * 2 + oversized, encoding="utf-8")
 
-    result = run_cli(path, *(["--json"] if json_output else []))
+    args = ["--json"] if output_format == "json" else ["--format", output_format]
+    result = run_cli(path, *args)
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     expected_total = "1" + "9" * 639 + "8"
-    if json_output:
+    if output_format == "json":
         summary = json.loads(result.stdout, parse_int=str)
         assert summary["request_count"] == "2"
         assert summary["malformed_count"] == "1"
         assert summary["total_bytes"] == expected_total
+    elif output_format == "csv":
+        assert list(csv.reader(result.stdout.splitlines()))[:4] == [
+            ["metric", "key", "value"], ["request_count", "", "2"],
+            ["malformed_count", "", "1"], ["total_bytes", "", expected_total],
+        ]
     else:
         assert "Requests: 2\nMalformed lines: 1\n" in result.stdout
         assert f"Total bytes: {expected_total}\n" in result.stdout
@@ -211,12 +260,22 @@ def test_sample_filters_in_both_formats(args, requests, total_bytes, json_output
         )
 
 
-def test_all_filters_intersect():
-    result = run_cli("sample/access.log", "--json", "--since", "2026-11-17T15:00:00Z",
+@pytest.mark.parametrize("csv_output", [False, True], ids=["json", "csv"])
+def test_all_filters_intersect(csv_output):
+    args = ["--format", "csv"] if csv_output else ["--json"]
+    result = run_cli("sample/access.log", *args, "--since", "2026-11-17T15:00:00Z",
                      "--until", "2026-11-17T15:30:00Z", "--status", "2xx", "--top", "1")
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
+    if csv_output:
+        assert list(csv.reader(result.stdout.splitlines())) == [
+            ["metric", "key", "value"], ["request_count", "", "1"],
+            ["malformed_count", "", "1"], ["total_bytes", "", "90"],
+            ["status_counts", "201", "1"], ["top_paths", "/checkout", "1"],
+            ["requests_per_hour", "2026-11-17T15:00:00Z", "1"],
+        ]
+        return
     assert json.loads(result.stdout) == {
         "request_count": 1, "malformed_count": 1, "total_bytes": 90,
         "status_counts": {"201": 1},
@@ -225,28 +284,39 @@ def test_all_filters_intersect():
     }
 
 
-def test_repeated_statuses_form_a_union_without_double_counting():
-    result = run_cli("sample/access.log", "--json", "--status", "2xx", "--status", "200",
+@pytest.mark.parametrize("csv_output", [False, True], ids=["json", "csv"])
+def test_repeated_statuses_form_a_union_without_double_counting(csv_output):
+    args = ["--format", "csv"] if csv_output else ["--json"]
+    result = run_cli("sample/access.log", *args, "--status", "2xx", "--status", "200",
                      "--status", "404", "--status", "404")
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
+    if csv_output:
+        assert list(csv.reader(result.stdout.splitlines()))[:8] == [
+            ["metric", "key", "value"], ["request_count", "", "6"],
+            ["malformed_count", "", "1"], ["total_bytes", "", "955"],
+            ["status_counts", "200", "3"], ["status_counts", "201", "1"],
+            ["status_counts", "204", "1"], ["status_counts", "404", "1"],
+        ]
+        return
     summary = json.loads(result.stdout)
     assert summary["request_count"] == 6
     assert summary["total_bytes"] == 955
     assert summary["status_counts"] == {"200": 3, "201": 1, "204": 1, "404": 1}
 
 
-@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("output_format", ["text", "json", "csv"])
 @pytest.mark.parametrize("top", [0, 3])
-def test_top_limits_only_paths_with_deterministic_ties(top, json_output):
-    result = run_cli("sample/access.log", "--top", top, *(["--json"] if json_output else []))
+def test_top_limits_only_paths_with_deterministic_ties(top, output_format):
+    args = ["--json"] if output_format == "json" else ["--format", output_format]
+    result = run_cli("sample/access.log", "--top", top, *args)
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     paths = [{"path": "/products", "count": 2}, {"path": "/", "count": 1},
              {"path": "/checkout", "count": 1}][:top]
-    if json_output:
+    if output_format == "json":
         summary = json.loads(result.stdout)
         assert summary["top_paths"] == paths
         assert summary["request_count"] == 6
@@ -254,23 +324,41 @@ def test_top_limits_only_paths_with_deterministic_ties(top, json_output):
         assert summary["requests_per_hour"] == {
             "2026-11-17T14:00:00Z": 3, "2026-11-17T15:00:00Z": 3,
         }
+    elif output_format == "csv":
+        assert list(csv.reader(result.stdout.splitlines())) == [
+            ["metric", "key", "value"], ["request_count", "", "6"],
+            ["malformed_count", "", "1"], ["total_bytes", "", "955"],
+            ["status_counts", "200", "3"], ["status_counts", "201", "1"],
+            ["status_counts", "204", "1"], ["status_counts", "404", "1"],
+        ] + [["top_paths", item["path"], str(item["count"])] for item in paths] + [
+            ["requests_per_hour", "2026-11-17T14:00:00Z", "3"],
+            ["requests_per_hour", "2026-11-17T15:00:00Z", "3"],
+        ]
     else:
         assert result.stdout.startswith("Requests: 6\nMalformed lines: 1\nTotal bytes: 955\n")
         rows = "".join(f"  {item['path']}: {item['count']}\n" for item in paths) or "  (none)\n"
         assert f"Top paths:\n{rows}Requests per hour (UTC):\n" in result.stdout
 
 
+@pytest.mark.parametrize("csv_output", [False, True], ids=["json", "csv"])
 @pytest.mark.parametrize("args", [
     ("--status", "500"),
     ("--since", "2026-11-18T00:00:00Z"),
     ("--since", "2026-11-17T15:00:00Z", "--until", "2026-11-17T15:00:00Z"),
 ])
-def test_filters_with_no_matches_preserve_malformed_count(args):
-    result = run_cli("sample/access.log", "--json", *args)
+def test_filters_with_no_matches_preserve_malformed_count(args, csv_output):
+    output_args = ["--format", "csv"] if csv_output else ["--json"]
+    result = run_cli("sample/access.log", *output_args, *args)
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
-    assert json.loads(result.stdout) == {**EMPTY_SUMMARY, "malformed_count": 1}
+    if csv_output:
+        assert list(csv.reader(result.stdout.splitlines())) == [
+            ["metric", "key", "value"], ["request_count", "", "0"],
+            ["malformed_count", "", "1"], ["total_bytes", "", "0"],
+        ]
+    else:
+        assert json.loads(result.stdout) == {**EMPTY_SUMMARY, "malformed_count": 1}
 
 
 @pytest.mark.parametrize("flag", ["--since", "--until"])
@@ -302,9 +390,25 @@ def test_invalid_timestamps_are_argument_errors(flag, value):
 @pytest.mark.parametrize("flag,value", [
     ("--status", "99"), ("--status", "600"), ("--status", "2XX"), ("--status", "200,404"),
     ("--top", "-1"), ("--top", "1.5"),
+    ("--format", "xml"), ("--format", "json"),
 ])
-def test_invalid_status_and_top_are_argument_errors(flag, value):
+def test_invalid_status_top_and_format_are_argument_errors(flag, value):
     assert_argument_error(flag, value)
+
+
+@pytest.mark.parametrize("output_format", ["text", "csv"])
+@pytest.mark.parametrize("json_first", [False, True])
+def test_json_and_explicit_format_are_mutually_exclusive(output_format, json_first):
+    args = ["--format", output_format]
+    args = ["--json", *args] if json_first else [*args, "--json"]
+    result = run_cli("sample/access.log", *args)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "usage:" in result.stderr.lower()
+    assert "--json" in result.stderr and "--format" in result.stderr
+    assert "unrecognized arguments" not in result.stderr.lower()
+    assert "traceback" not in result.stderr.lower()
 
 
 def assert_argument_error(flag, value):

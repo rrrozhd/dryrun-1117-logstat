@@ -16,7 +16,7 @@ _RECORD = re.compile(
 )
 
 
-def _parse(line: str) -> tuple[str, str, int, str] | None:
+def _parse(line: str) -> tuple[str, str, int, datetime] | None:
     line = line.rstrip("\r\n")
     if any(ord(char) < 32 or ord(char) == 127 or char == "\ufffd" for char in line):
         return None
@@ -41,14 +41,27 @@ def _parse(line: str) -> tuple[str, str, int, str] | None:
     path = target.split("?", 1)[0]
     if not path:
         return None
-    hour_key = timestamp.replace(minute=0, second=0).isoformat().replace("+00:00", "Z")
-    return path, status, byte_count, hour_key
+    return path, status, byte_count, timestamp
 
 
-def summarize(lines: Iterable[str]) -> dict:
-    """Count valid records, skipping malformed lines, and group requests in UTC."""
+def summarize(
+    lines: Iterable[str], *, since: datetime | None = None,
+    until: datetime | None = None, statuses: set[str] | None = None, top: int = 10,
+) -> dict:
+    """Summarize matching records within [since, until), grouped in UTC.
+
+    Bounds must be timezone-aware. None selects all statuses; an empty set selects
+    none. Malformed counts cover all input; top limits only the returned paths.
+    """
+    for name, bound in (("since", since), ("until", until)):
+        if bound is not None and bound.utcoffset() is None:
+            raise ValueError(f"{name} must be timezone-aware")
+    if since is not None and until is not None and since > until:
+        raise ValueError("since must not be later than until")
+    if not isinstance(top, int) or top < 0:
+        raise ValueError("top must be a nonnegative integer")
     request_count = malformed_count = total_bytes = 0
-    statuses: Counter[str] = Counter()
+    status_counts: Counter[str] = Counter()
     paths: Counter[str] = Counter()
     hours: Counter[str] = Counter()
     for line in lines:
@@ -56,20 +69,27 @@ def summarize(lines: Iterable[str]) -> dict:
         if record is None:
             malformed_count += 1
             continue
-        path, status, byte_count, hour = record
+        path, status, byte_count, timestamp = record
+        if since is not None and timestamp < since:
+            continue
+        if until is not None and timestamp >= until:
+            continue
+        if statuses is not None and status not in statuses:
+            continue
+        hour = timestamp.replace(minute=0, second=0).isoformat().replace("+00:00", "Z")
         request_count += 1
         total_bytes += byte_count
-        statuses[status] += 1
+        status_counts[status] += 1
         paths[path] += 1
         hours[hour] += 1
     return {
         "request_count": request_count,
         "malformed_count": malformed_count,
         "total_bytes": total_bytes,
-        "status_counts": dict(sorted(statuses.items())),
+        "status_counts": dict(sorted(status_counts.items())),
         "top_paths": [
             {"path": path, "count": count}
-            for path, count in sorted(paths.items(), key=lambda item: (-item[1], item[0]))[:10]
+            for path, count in sorted(paths.items(), key=lambda item: (-item[1], item[0]))[:top]
         ],
         "requests_per_hour": dict(sorted(hours.items())),
     }

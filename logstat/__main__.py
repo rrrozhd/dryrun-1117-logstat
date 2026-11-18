@@ -1,7 +1,9 @@
 """Command-line summaries of Common Log Format access logs."""
 
 import argparse
+import csv
 from datetime import datetime
+import io
 import json
 import re
 import sys
@@ -63,12 +65,32 @@ def format_text(summary: dict) -> str:
     return "\n".join(lines)
 
 
+def format_csv(summary: dict) -> str:
+    """Render summary numbers as metric, key and value records."""
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(("metric", "key", "value"))
+    for metric in ("request_count", "malformed_count", "total_bytes"):
+        writer.writerow((metric, "", summary[metric]))
+    sections = [
+        ("status_counts", summary["status_counts"].items()),
+        ("top_paths", ((item["path"], item["count"]) for item in summary["top_paths"])),
+        ("requests_per_hour", summary["requests_per_hour"].items()),
+    ]
+    for metric, entries in sections:
+        writer.writerows((metric, key, value) for key, value in entries)
+    return output.getvalue()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="logstat", description="Summarize Common Log Format access logs."
     )
     parser.add_argument("logfile", help="path to the access log")
-    parser.add_argument("--json", action="store_true", help="print the summary as JSON")
+    output_options = parser.add_mutually_exclusive_group()
+    output_options.add_argument("--json", action="store_true", help="print the summary as JSON")
+    output_options.add_argument("--format", choices=("text", "csv"), default="text",
+                                help="summary output format (default: text)")
     parser.add_argument("--since", type=utc_timestamp, metavar="UTC",
                         help="include requests at or after this UTC timestamp")
     parser.add_argument("--until", type=utc_timestamp, metavar="UTC",
@@ -96,10 +118,13 @@ def main() -> int:
         # Change only output conversion, using a finite bound, then restore it.
         if limit and summary["total_bytes"] >= 10**limit:
             sys.set_int_max_str_digits(summary["total_bytes"].bit_length())
-        output = json.dumps(summary, indent=2) if args.json else format_text(summary)
+        if args.format == "csv":
+            output = format_csv(summary)
+        else:
+            output = json.dumps(summary, indent=2) if args.json else format_text(summary)
     finally:
         sys.set_int_max_str_digits(limit)
-    print(output)
+    print(output, end="" if args.format == "csv" else "\n")
     return 0
 
 
